@@ -1,0 +1,124 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+# İmzalı IPA için (isteğe bağlı) Settings > Secrets > Actions altına şunları ekle:
+#   IOS_P12_BASE64        : .p12 sertifikasının base64 hali   (base64 -i cert.p12 | pbcopy)
+#   IOS_P12_PASSWORD      : .p12 şifresi
+#   IOS_PROVISION_BASE64  : .mobileprovision dosyasının base64 hali
+#   IOS_TEAM_ID           : Apple Developer Team ID (10 karakter)
+# Secret yoksa sadece İMZASIZ IPA üretilir (AltStore / Sideloadly / TrollStore ile yüklenir).
+
+env:
+  SCHEME: Jarvis
+  APP_NAME: Jarvis
+  SIGN_IDENTITY: Apple Distribution      # development profili kullanıyorsan: Apple Development
+  EXPORT_METHOD: ad-hoc                  # ad-hoc | development | app-store
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      IOS_P12_BASE64: ${{ secrets.IOS_P12_BASE64 }}
+      IOS_P12_PASSWORD: ${{ secrets.IOS_P12_PASSWORD }}
+      IOS_PROVISION_BASE64: ${{ secrets.IOS_PROVISION_BASE64 }}
+      IOS_TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: XcodeGen kur ve projeyi üret
+        run: |
+          brew install xcodegen
+          xcodegen generate
+          xcodebuild -version
+
+      # ---------- 1) İMZASIZ IPA (her zaman) ----------
+      - name: Derle (imzasız)
+        run: |
+          xcodebuild build \
+            -project "$APP_NAME.xcodeproj" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
+
+      - name: IPA'ya paketle
+        run: |
+          APP="build/Build/Products/Release-iphoneos/$APP_NAME.app"
+          test -d "$APP"
+          rm -rf Payload && mkdir Payload
+          cp -R "$APP" Payload/
+          mkdir -p out
+          zip -qry "out/$APP_NAME-unsigned.ipa" Payload
+          ls -lh out
+
+      # ---------- 2) İMZALI IPA (secret'lar varsa) ----------
+      - name: Sertifika ve profili kur
+        if: env.IOS_P12_BASE64 != '' && env.IOS_PROVISION_BASE64 != ''
+        run: |
+          KC="$RUNNER_TEMP/build.keychain-db"
+          echo "$IOS_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          echo "$IOS_PROVISION_BASE64" | base64 --decode > "$RUNNER_TEMP/profile.mobileprovision"
+
+          security create-keychain -p "tmp-pass" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "tmp-pass" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -P "$IOS_P12_PASSWORD" -A -t cert -f pkcs12 -k "$KC"
+          security set-key-partition-list -S apple-tool:,apple: -k "tmp-pass" "$KC"
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+
+          security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          PUUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$RUNNER_TEMP/profile.plist")
+          PNAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$RUNNER_TEMP/profile.plist")
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$PUUID.mobileprovision"
+          echo "PROFILE_NAME=$PNAME" >> "$GITHUB_ENV"
+
+      - name: Archive + export (imzalı)
+        if: env.IOS_P12_BASE64 != '' && env.IOS_PROVISION_BASE64 != ''
+        run: |
+          xcodebuild archive \
+            -project "$APP_NAME.xcodeproj" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/$APP_NAME.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="$IOS_TEAM_ID" \
+            CODE_SIGN_IDENTITY="$SIGN_IDENTITY" \
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME"
+
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>$EXPORT_METHOD</string>
+            <key>teamID</key><string>$IOS_TEAM_ID</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key><dict>
+              <key>com.jarvis.ai</key><string>$PROFILE_NAME</string>
+            </dict>
+            <key>compileBitcode</key><false/>
+          </dict></plist>
+          PLIST
+
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/$APP_NAME.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export"
+          cp "$RUNNER_TEMP/export/"*.ipa "out/$APP_NAME-signed.ipa"
+
+      - name: IPA'ları yükle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Jarvis-ipa
+          path: out/*.ipa
+          if-no-files-found: error
+          
